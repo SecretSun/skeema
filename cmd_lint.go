@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/mybase"
 	"github.com/skeema/skeema/fs"
+	"github.com/skeema/skeema/linter"
 	"github.com/skeema/skeema/workspace"
 	"github.com/skeema/tengo"
 )
@@ -43,125 +43,81 @@ func LintHandler(cfg *mybase.Config) error {
 		return err
 	}
 
-	lc := &lintCounters{}
-	if err = lintWalker(dir, lc, 5); err != nil {
-		return err
-	}
-	return lc.exitValue()
-}
-
-type lintCounters struct {
-	errCount      int
-	sqlErrCount   int
-	reformatCount int
-}
-
-func (lc *lintCounters) exitValue() error {
-	var plural string
-	if lc.errCount > 1 || (lc.errCount == 0 && lc.sqlErrCount > 1) {
-		plural = "s"
+	result := lintWalker(dir, 5)
+	for _, err := range result.Exceptions {
+		if _, ok := err.(linter.ConfigError); ok {
+			return NewExitValue(CodeBadConfig, err.Error())
+		}
 	}
 	switch {
-	case lc.errCount > 0:
-		return NewExitValue(CodeFatalError, "Skipped %d operation%s due to error%s", lc.errCount, plural, plural)
-	case lc.sqlErrCount > 0:
-		return NewExitValue(CodeFatalError, "Found syntax error%s in %d SQL file%s", plural, lc.sqlErrCount, plural)
-	case lc.reformatCount > 0:
+	case len(result.Exceptions) > 0:
+		return NewExitValue(CodeFatalError, "Skipped %d operations due to fatal errors", len(result.Exceptions))
+	case len(result.Errors) > 0:
+		return NewExitValue(CodeFatalError, "Found %d errors", len(result.Errors))
+	case len(result.Warnings) > 0:
+		return NewExitValue(CodeDifferencesFound, "Found %d warnings", len(result.Warnings))
+	case len(result.FormatNotices) > 0:
 		return NewExitValue(CodeDifferencesFound, "")
 	}
 	return nil
 }
 
-func lintWalker(dir *fs.Dir, lc *lintCounters, maxDepth int) error {
+func lintWalker(dir *fs.Dir, maxDepth int) *linter.Result {
 	log.Infof("Linting %s", dir)
 	if len(dir.IgnoredStatements) > 0 {
 		log.Warnf("Ignoring %d non-CREATE TABLE statements found in this directory's *.sql files", len(dir.IgnoredStatements))
 	}
 
-	ignoreTable, err := dir.Config.GetRegexp("ignore-table")
-	if err != nil {
-		return NewExitValue(CodeBadConfig, err.Error())
-	}
-
 	// Connect to first defined instance, unless configured to use local Docker
 	var inst *tengo.Instance
 	if wsType, _ := dir.Config.GetEnum("workspace", "temp-schema", "docker"); wsType != "docker" || !dir.Config.Changed("flavor") {
+		var err error
 		if inst, err = dir.FirstInstance(); err != nil {
-			return err
+			return linter.BadConfigResult(err)
 		}
 	}
 
 	opts, err := workspace.OptionsForDir(dir, inst)
 	if err != nil {
-		return NewExitValue(CodeBadConfig, err.Error())
+		return linter.BadConfigResult(err)
 	}
 
-	for _, logicalSchema := range dir.LogicalSchemas {
-		// ignore-schema is handled relatively simplistically here: skip dir entirely
-		// if any literal schema name matches the pattern, but don't bother
-		// interpretting schema=`shellout` or schema=*, which require an instance.
-		ignoreSchema, err := dir.Config.GetRegexp("ignore-schema")
+	result := linter.LintDir(dir, opts)
+	for _, err := range result.Exceptions {
+		log.Error(err.Error())
+	}
+	for _, annotation := range result.Errors {
+		log.Error(annotation.Message)
+	}
+	for _, annotation := range result.Warnings {
+		log.Warning(annotation.Message)
+	}
+	for _, annotation := range result.FormatNotices {
+		annotation.Statement.Text = annotation.Message
+		length, err := annotation.Statement.FromFile.Rewrite()
 		if err != nil {
-			return NewExitValue(CodeBadConfig, err.Error())
-		} else if ignoreSchema != nil {
-			var foundIgnoredName bool
-			for _, schemaName := range dir.Config.GetSlice("schema", ',', true) {
-				if ignoreSchema.MatchString(schemaName) {
-					foundIgnoredName = true
-				}
-			}
-			if foundIgnoredName {
-				log.Warnf("Skipping schema in %s because ignore-schema='%s'", dir.Path, ignoreSchema)
-				break
-			}
+			writeErr := fmt.Errorf("Unable to write to %s: %s", annotation.Statement.File, err)
+			log.Error(writeErr.Error())
+			result.Exceptions = append(result.Exceptions, writeErr)
+		} else {
+			log.Infof("Wrote %s (%d bytes) -- updated file to normalize format", annotation.Statement.File, length)
 		}
-
-		schema, statementErrors, err := workspace.ExecLogicalSchema(logicalSchema, opts)
-		if err != nil {
-			log.Errorf("Skipping schema in %s due to error: %s", dir.Path, err)
-			lc.errCount++
-			continue
-		}
-		for _, stmtErr := range statementErrors {
-			if ignoreTable != nil && ignoreTable.MatchString(stmtErr.TableName) {
-				log.Debugf("Skipping table %s because ignore-table='%s'", stmtErr.TableName, ignoreTable)
-				continue
-			}
-			log.Error(stmtErr.Error())
-			lc.sqlErrCount++
-		}
-		for _, table := range schema.Tables {
-			if ignoreTable != nil && ignoreTable.MatchString(table.Name) {
-				log.Debugf("Skipping table %s because ignore-table='%s'", table.Name, ignoreTable)
-				continue
-			}
-			body, suffix := logicalSchema.CreateTables[table.Name].SplitTextBody()
-			if table.CreateStatement != body {
-				logicalSchema.CreateTables[table.Name].Text = fmt.Sprintf("%s%s", table.CreateStatement, suffix)
-				length, err := logicalSchema.CreateTables[table.Name].FromFile.Rewrite()
-				if err != nil {
-					return fmt.Errorf("Unable to write to %s: %s", logicalSchema.CreateTables[table.Name].File, err)
-				}
-				log.Infof("Wrote %s (%d bytes) -- updated file to normalize format", logicalSchema.CreateTables[table.Name].File, length)
-				lc.reformatCount++
-			}
-		}
-		os.Stderr.WriteString("\n")
+	}
+	for _, dl := range result.DebugLogs {
+		log.Debug(dl)
 	}
 
 	if subdirs, badCount, err := dir.Subdirs(); err != nil {
-		log.Errorf("Cannot list subdirs of %s: %s", dir, err)
-		lc.errCount++
+		result.Exceptions = append(result.Exceptions, fmt.Errorf("Cannot list subdirs of %s: %s", dir, err))
 	} else if len(subdirs) > 0 && maxDepth <= 0 {
-		log.Warnf("Not walking subdirs of %s: max depth reached", dir)
-		lc.errCount += len(subdirs)
+		result.Exceptions = append(result.Exceptions, fmt.Errorf("Not walking subdirs of %s: max depth reached", dir))
 	} else {
-		lc.errCount += badCount
+		if badCount > 0 {
+			result.Exceptions = append(result.Exceptions, fmt.Errorf("Ignoring %d subdirs of %s with configuration errors", badCount, dir))
+		}
 		for _, sub := range subdirs {
-			if walkErr := lintWalker(sub, lc, maxDepth-1); walkErr != nil {
-				return walkErr
-			}
+			result.Merge(lintWalker(sub, maxDepth-1))
 		}
 	}
-	return nil
+	return result
 }
