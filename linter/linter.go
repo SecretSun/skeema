@@ -4,10 +4,8 @@ package linter
 import (
 	"fmt"
 
-	"github.com/skeema/mybase"
 	"github.com/skeema/skeema/fs"
 	"github.com/skeema/skeema/workspace"
-	//	"github.com/skeema/tengo"
 )
 
 // Annotation is an error, warning, or notice from linting a single SQL
@@ -17,6 +15,17 @@ type Annotation struct {
 	LineOffset int
 	Summary    string
 	Message    string
+}
+
+// MessageWithLocation prepends statement location information to a.Message,
+// if location information is available. Otherwise, it appends the full SQL
+// statement that the message refers to.
+func (a *Annotation) MessageWithLocation() string {
+	loc := a.Statement.Location()
+	if loc == "" {
+		return fmt.Sprintf("%s [Full SQL: %s]", a.Message, a.Statement.Text)
+	}
+	return fmt.Sprintf("%s: %s", loc, a.Message)
 }
 
 // Result is a combined set of linter annotations and/or Golang errors found
@@ -50,16 +59,8 @@ func BadConfigResult(err error) *Result {
 	}
 }
 
-// AddOptions adds linting-related options to the supplied mybase.Command.
-func AddOptions(cmd *mybase.Command) {
-	cmd.AddOption(mybase.StringOption("lint-warning", 0, "bad-charset,bad-engine", "Linter problems to treat as warnings; see full docs for usage"))
-	cmd.AddOption(mybase.StringOption("lint-error", 0, "no-pk", "Linter problems to treat as errors; see full docs for usage"))
-	cmd.AddOption(mybase.StringOption("lint-allowed-charset", 0, "latin1,utf8mb4", "Whitelist of acceptable character sets"))
-	cmd.AddOption(mybase.StringOption("lint-allowed-engine", 0, "innodb", "Whitelist of acceptable storage engines"))
-}
-
 // LintDir lints dir and its subdirs, returning a cumulative result.
-func LintDir(dir *fs.Dir, opts workspace.Options) *Result {
+func LintDir(dir *fs.Dir, wsOpts workspace.Options) *Result {
 	result := &Result{}
 
 	ignoreTable, err := dir.Config.GetRegexp("ignore-table")
@@ -67,6 +68,10 @@ func LintDir(dir *fs.Dir, opts workspace.Options) *Result {
 		return BadConfigResult(err)
 	}
 	ignoreSchema, err := dir.Config.GetRegexp("ignore-schema")
+	if err != nil {
+		return BadConfigResult(err)
+	}
+	opts, err := OptionsForDir(dir)
 	if err != nil {
 		return BadConfigResult(err)
 	}
@@ -88,7 +93,7 @@ func LintDir(dir *fs.Dir, opts workspace.Options) *Result {
 			}
 		}
 
-		schema, statementErrors, err := workspace.ExecLogicalSchema(logicalSchema, opts)
+		schema, statementErrors, err := workspace.ExecLogicalSchema(logicalSchema, wsOpts)
 		if err != nil {
 			result.Exceptions = append(result.Exceptions, fmt.Errorf("Skipping schema in %s due to error: %s", dir.RelPath(), err))
 			continue
@@ -101,9 +106,19 @@ func LintDir(dir *fs.Dir, opts workspace.Options) *Result {
 			result.Errors = append(result.Errors, &Annotation{
 				Statement: stmtErr.Statement,
 				Summary:   "SQL statement returned an error",
-				Message:   stmtErr.Error(),
+				Message:   stmtErr.Err.Error(),
 			})
 		}
+
+		for problemName, severity := range opts.ProblemSeverity {
+			annotations := problems[problemName](schema, logicalSchema, opts)
+			if severity == SeverityWarning {
+				result.Warnings = append(result.Warnings, annotations...)
+			} else {
+				result.Errors = append(result.Errors, annotations...)
+			}
+		}
+
 		for _, table := range schema.Tables {
 			if ignoreTable != nil && ignoreTable.MatchString(table.Name) {
 				result.DebugLogs = append(result.DebugLogs, fmt.Sprintf("Skipping table %s because ignore-table='%s'", table.Name, ignoreTable))
@@ -120,12 +135,4 @@ func LintDir(dir *fs.Dir, opts workspace.Options) *Result {
 		}
 	}
 	return result
-}
-
-// ConfigError represents a configuration problem encountered at runtime.
-type ConfigError string
-
-// Error satisfies the builtin error interface.
-func (ce ConfigError) Error() string {
-	return string(ce)
 }

@@ -32,6 +32,7 @@ An exit code of 0 will be returned if all files were already formatted properly,
 file had SQL syntax errors or some other error occurred.`
 
 	cmd := mybase.NewCommand("lint", summary, desc, LintHandler)
+	linter.AddCommandOptions(cmd)
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -87,10 +88,10 @@ func lintWalker(dir *fs.Dir, maxDepth int) *linter.Result {
 		log.Error(err.Error())
 	}
 	for _, annotation := range result.Errors {
-		log.Error(annotation.Message)
+		log.Error(annotation.MessageWithLocation())
 	}
 	for _, annotation := range result.Warnings {
-		log.Warning(annotation.Message)
+		log.Warning(annotation.MessageWithLocation())
 	}
 	for _, annotation := range result.FormatNotices {
 		annotation.Statement.Text = annotation.Message
